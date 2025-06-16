@@ -1,4 +1,3 @@
-use crate::platform::scap_screen_capture::scap_screen_sources;
 use core::str;
 use std::{
     cell::RefCell,
@@ -29,7 +28,7 @@ use x11rb::{
     protocol::xkb::ConnectionExt as _,
     protocol::xproto::{
         AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
-        ConnectionExt as _, EventMask, KeyPressEvent,
+        ConnectionExt as _, EventMask, KeyPressEvent, Visibility,
     },
     protocol::{Event, randr, render, xinput, xkb, xproto},
     resource_manager::Database,
@@ -41,8 +40,9 @@ use xkbc::x11::ffi::{XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSIO
 use xkbcommon::xkb::{self as xkbc, LayoutIndex, ModMask, STATE_LAYOUT_EFFECTIVE};
 
 use super::{
-    ButtonOrScroll, ScrollDirection, button_or_scroll_from_event_detail, get_valuator_axis_index,
-    modifiers_from_state, pressed_button_from_mask,
+    ButtonOrScroll, ScrollDirection, button_or_scroll_from_event_detail,
+    clipboard::{self, Clipboard},
+    get_valuator_axis_index, modifiers_from_state, pressed_button_from_mask,
 };
 use super::{X11Display, X11WindowStatePtr, XcbAtoms};
 use super::{XimCallbackEvent, XimHandler};
@@ -56,6 +56,7 @@ use crate::platform::{
         reveal_path_internal,
         xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
     },
+    scap_screen_capture::scap_screen_sources,
 };
 use crate::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
@@ -77,7 +78,10 @@ pub(crate) const XINPUT_ALL_DEVICE_GROUPS: xinput::DeviceId = 1;
 
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
-    refresh_event_token: RegistrationToken,
+    refresh_state: Option<RefreshState>,
+    expose_event_received: bool,
+    last_visibility: Visibility,
+    is_mapped: bool,
 }
 
 impl WindowRef {
@@ -92,6 +96,16 @@ impl Deref for WindowRef {
     fn deref(&self) -> &Self::Target {
         &self.window
     }
+}
+
+enum RefreshState {
+    Hidden {
+        refresh_rate: Duration,
+    },
+    PeriodicRefresh {
+        refresh_rate: Duration,
+        event_loop_token: RegistrationToken,
+    },
 }
 
 #[derive(Debug)]
@@ -201,7 +215,7 @@ pub struct X11ClientState {
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
 
     pub(crate) common: LinuxCommon,
-    pub(crate) clipboard: x11_clipboard::Clipboard,
+    pub(crate) clipboard: Clipboard,
     pub(crate) clipboard_item: Option<ClipboardItem>,
     pub(crate) xdnd_state: Xdnd,
 }
@@ -219,7 +233,14 @@ impl X11ClientStatePtr {
         let mut state = client.0.borrow_mut();
 
         if let Some(window_ref) = state.windows.remove(&x_window) {
-            state.loop_handle.remove(window_ref.refresh_event_token);
+            match window_ref.refresh_state {
+                Some(RefreshState::PeriodicRefresh {
+                    event_loop_token, ..
+                }) => {
+                    state.loop_handle.remove(event_loop_token);
+                }
+                _ => {}
+            }
         }
         if state.mouse_focused_window == Some(x_window) {
             state.mouse_focused_window = None;
@@ -388,7 +409,7 @@ impl X11Client {
             .reply()
             .unwrap();
 
-        let clipboard = x11_clipboard::Clipboard::new().unwrap();
+        let clipboard = Clipboard::new().unwrap();
 
         let xcb_connection = Rc::new(xcb_connection);
 
@@ -549,10 +570,9 @@ impl X11Client {
             }
 
             for window in windows_to_refresh.into_iter() {
-                if let Some(window) = self.get_window(window) {
-                    window.refresh(RequestFrameOptions {
-                        require_presentation: true,
-                    });
+                let mut state = self.0.borrow_mut();
+                if let Some(window) = state.windows.get_mut(&window) {
+                    window.expose_event_received = true;
                 }
             }
 
@@ -660,6 +680,27 @@ impl X11Client {
 
     fn handle_event(&self, event: Event) -> Option<()> {
         match event {
+            Event::UnmapNotify(event) => {
+                let mut state = self.0.borrow_mut();
+                if let Some(window_ref) = state.windows.get_mut(&event.window) {
+                    window_ref.is_mapped = false;
+                }
+                state.update_refresh_loop(event.window);
+            }
+            Event::MapNotify(event) => {
+                let mut state = self.0.borrow_mut();
+                if let Some(window_ref) = state.windows.get_mut(&event.window) {
+                    window_ref.is_mapped = true;
+                }
+                state.update_refresh_loop(event.window);
+            }
+            Event::VisibilityNotify(event) => {
+                let mut state = self.0.borrow_mut();
+                if let Some(window_ref) = state.windows.get_mut(&event.window) {
+                    window_ref.last_visibility = event.state;
+                }
+                state.update_refresh_loop(event.window);
+            }
             Event::ClientMessage(event) => {
                 let window = self.get_window(event.window)?;
                 let [atom, arg1, arg2, arg3, arg4] = event.data.as_data32();
@@ -825,7 +866,7 @@ impl X11Client {
                 self.reset_ime();
                 window.handle_ime_delete();
             }
-            Event::XkbNewKeyboardNotify(_) | Event::MapNotify(_) => {
+            Event::XkbNewKeyboardNotify(_) | Event::XkbMapNotify(_) => {
                 let mut state = self.0.borrow_mut();
                 let xkb_state = {
                     let xkb_keymap = xkbc::x11::keymap_new_from_device(
@@ -1382,61 +1423,12 @@ impl LinuxClient for X11Client {
             )
             .unwrap();
 
-        let screen_resources = state
-            .xcb_connection
-            .randr_get_screen_resources(x_window)
-            .unwrap()
-            .reply()
-            .expect("Could not find available screens");
-
-        let mode = screen_resources
-            .crtcs
-            .iter()
-            .find_map(|crtc| {
-                let crtc_info = state
-                    .xcb_connection
-                    .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
-                    .ok()?
-                    .reply()
-                    .ok()?;
-
-                screen_resources
-                    .modes
-                    .iter()
-                    .find(|m| m.id == crtc_info.mode)
-            })
-            .expect("Unable to find screen refresh rate");
-
-        let refresh_event_token = state
-            .loop_handle
-            .insert_source(calloop::timer::Timer::immediate(), {
-                let refresh_duration = mode_refresh_rate(mode);
-                move |mut instant, (), client| {
-                    let xcb_connection = {
-                        let state = client.0.borrow_mut();
-                        let xcb_connection = state.xcb_connection.clone();
-                        if let Some(window) = state.windows.get(&x_window) {
-                            let window = window.window.clone();
-                            drop(state);
-                            window.refresh(Default::default());
-                        }
-                        xcb_connection
-                    };
-                    client.process_x11_events(&xcb_connection).log_err();
-
-                    // Take into account that some frames have been skipped
-                    let now = Instant::now();
-                    while instant < now {
-                        instant += refresh_duration;
-                    }
-                    calloop::timer::TimeoutAction::ToInstant(instant)
-                }
-            })
-            .expect("Failed to initialize refresh timer");
-
         let window_ref = WindowRef {
             window: window.0.clone(),
-            refresh_event_token,
+            refresh_state: None,
+            expose_event_received: false,
+            last_visibility: Visibility::UNOBSCURED,
+            is_mapped: false,
         };
 
         state.windows.insert(x_window, window_ref);
@@ -1504,39 +1496,36 @@ impl LinuxClient for X11Client {
         let state = self.0.borrow_mut();
         state
             .clipboard
-            .store(
-                state.clipboard.setter.atoms.primary,
-                state.clipboard.setter.atoms.utf8_string,
-                item.text().unwrap_or_default().as_bytes(),
+            .set_text(
+                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
+                clipboard::ClipboardKind::Primary,
+                clipboard::WaitConfig::None,
             )
-            .ok();
+            .context("Failed to write to clipboard (primary)")
+            .log_with_level(log::Level::Debug);
     }
 
     fn write_to_clipboard(&self, item: crate::ClipboardItem) {
         let mut state = self.0.borrow_mut();
         state
             .clipboard
-            .store(
-                state.clipboard.setter.atoms.clipboard,
-                state.clipboard.setter.atoms.utf8_string,
-                item.text().unwrap_or_default().as_bytes(),
+            .set_text(
+                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
+                clipboard::ClipboardKind::Clipboard,
+                clipboard::WaitConfig::None,
             )
-            .ok();
+            .context("Failed to write to clipboard (clipboard)")
+            .log_with_level(log::Level::Debug);
         state.clipboard_item.replace(item);
     }
 
     fn read_from_primary(&self) -> Option<crate::ClipboardItem> {
         let state = self.0.borrow_mut();
-        state
+        return state
             .clipboard
-            .load(
-                state.clipboard.getter.atoms.primary,
-                state.clipboard.getter.atoms.utf8_string,
-                state.clipboard.getter.atoms.property,
-                Duration::from_secs(3),
-            )
-            .map(|text| crate::ClipboardItem::new_string(String::from_utf8(text).unwrap()))
-            .ok()
+            .get_any(clipboard::ClipboardKind::Primary)
+            .context("Failed to read from clipboard (primary)")
+            .log_with_level(log::Level::Debug);
     }
 
     fn read_from_clipboard(&self) -> Option<crate::ClipboardItem> {
@@ -1545,26 +1534,15 @@ impl LinuxClient for X11Client {
         // which has metadata attached.
         if state
             .clipboard
-            .setter
-            .connection
-            .get_selection_owner(state.clipboard.setter.atoms.clipboard)
-            .ok()
-            .and_then(|r| r.reply().ok())
-            .map(|reply| reply.owner == state.clipboard.setter.window)
-            .unwrap_or(false)
+            .is_owner(clipboard::ClipboardKind::Clipboard)
         {
             return state.clipboard_item.clone();
         }
-        state
+        return state
             .clipboard
-            .load(
-                state.clipboard.getter.atoms.clipboard,
-                state.clipboard.getter.atoms.utf8_string,
-                state.clipboard.getter.atoms.property,
-                Duration::from_secs(3),
-            )
-            .map(|text| crate::ClipboardItem::new_string(String::from_utf8(text).unwrap()))
-            .ok()
+            .get_any(clipboard::ClipboardKind::Clipboard)
+            .context("Failed to read from clipboard (clipboard)")
+            .log_with_level(log::Level::Debug);
     }
 
     fn run(&self) {
@@ -1628,6 +1606,119 @@ impl LinuxClient for X11Client {
         }
 
         Some(handles)
+    }
+}
+
+impl X11ClientState {
+    fn update_refresh_loop(&mut self, x_window: xproto::Window) {
+        let Some(window_ref) = self.windows.get_mut(&x_window) else {
+            return;
+        };
+        let is_visible = window_ref.is_mapped
+            && !matches!(window_ref.last_visibility, Visibility::FULLY_OBSCURED);
+        match (is_visible, window_ref.refresh_state.take()) {
+            (false, refresh_state @ Some(RefreshState::Hidden { .. }))
+            | (false, refresh_state @ None)
+            | (true, refresh_state @ Some(RefreshState::PeriodicRefresh { .. })) => {
+                window_ref.refresh_state = refresh_state;
+            }
+            (
+                false,
+                Some(RefreshState::PeriodicRefresh {
+                    refresh_rate,
+                    event_loop_token,
+                }),
+            ) => {
+                self.loop_handle.remove(event_loop_token);
+                window_ref.refresh_state = Some(RefreshState::Hidden { refresh_rate });
+            }
+            (true, Some(RefreshState::Hidden { refresh_rate })) => {
+                let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
+                let Some(window_ref) = self.windows.get_mut(&x_window) else {
+                    return;
+                };
+                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
+                    refresh_rate,
+                    event_loop_token,
+                });
+            }
+            (true, None) => {
+                let screen_resources = self
+                    .xcb_connection
+                    .randr_get_screen_resources_current(x_window)
+                    .unwrap()
+                    .reply()
+                    .expect("Could not find available screens");
+
+                // Ideally this would be re-queried when the window changes screens, but there
+                // doesn't seem to be an efficient / straightforward way to do this. Should also be
+                // updated when screen configurations change.
+                let refresh_rate = mode_refresh_rate(
+                    screen_resources
+                        .crtcs
+                        .iter()
+                        .find_map(|crtc| {
+                            let crtc_info = self
+                                .xcb_connection
+                                .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
+                                .ok()?
+                                .reply()
+                                .ok()?;
+
+                            screen_resources
+                                .modes
+                                .iter()
+                                .find(|m| m.id == crtc_info.mode)
+                        })
+                        .expect("Unable to find screen refresh rate"),
+                );
+
+                let event_loop_token = self.start_refresh_loop(x_window, refresh_rate);
+                let Some(window_ref) = self.windows.get_mut(&x_window) else {
+                    return;
+                };
+                window_ref.refresh_state = Some(RefreshState::PeriodicRefresh {
+                    refresh_rate,
+                    event_loop_token,
+                });
+            }
+        }
+    }
+
+    #[must_use]
+    fn start_refresh_loop(
+        &self,
+        x_window: xproto::Window,
+        refresh_rate: Duration,
+    ) -> RegistrationToken {
+        self.loop_handle
+            .insert_source(calloop::timer::Timer::immediate(), {
+                move |mut instant, (), client| {
+                    let xcb_connection = {
+                        let mut state = client.0.borrow_mut();
+                        let xcb_connection = state.xcb_connection.clone();
+                        if let Some(window) = state.windows.get_mut(&x_window) {
+                            let expose_event_received = window.expose_event_received;
+                            window.expose_event_received = false;
+                            let window = window.window.clone();
+                            drop(state);
+                            window.refresh(RequestFrameOptions {
+                                require_presentation: expose_event_received,
+                            });
+                        }
+                        xcb_connection
+                    };
+                    client.process_x11_events(&xcb_connection).log_err();
+
+                    // Take into account that some frames have been skipped
+                    let now = Instant::now();
+                    while instant < now {
+                        instant += refresh_rate;
+                    }
+                    calloop::timer::TimeoutAction::ToInstant(instant)
+                }
+            })
+            .expect("Failed to initialize refresh timer")
     }
 }
 

@@ -10,7 +10,7 @@ use assistant_tool::{
     ToolUseStatus,
 };
 use buffer_diff::{BufferDiff, BufferDiffSnapshot};
-use editor::{Editor, EditorMode, MinimapVisibility, MultiBuffer, PathKey};
+use editor::{Editor, EditorMode, MinimapVisibility, MultiBuffer, PathKey, scroll::Autoscroll};
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, AnyWindowHandle, App, AppContext, AsyncApp, Entity, Task,
@@ -69,13 +69,13 @@ pub struct EditFileToolInput {
     /// start each path with one of the project's root directories.
     ///
     /// The following examples assume we have two root directories in the project:
-    /// - backend
-    /// - frontend
+    /// - /a/b/backend
+    /// - /c/d/frontend
     ///
     /// <example>
     /// `backend/src/main.rs`
     ///
-    /// Notice how the file path starts with root-1. Without that, the path
+    /// Notice how the file path starts with `backend`. Without that, the path
     /// would be ambiguous and the call would fail!
     /// </example>
     ///
@@ -239,6 +239,7 @@ impl Tool for EditFileTool {
             };
 
             let mut hallucinated_old_text = false;
+            let mut ambiguous_ranges = Vec::new();
             while let Some(event) = events.next().await {
                 match event {
                     EditAgentOutputEvent::Edited => {
@@ -247,6 +248,7 @@ impl Tool for EditFileTool {
                         }
                     }
                     EditAgentOutputEvent::UnresolvedEditRange => hallucinated_old_text = true,
+                    EditAgentOutputEvent::AmbiguousEditRange(ranges) => ambiguous_ranges = ranges,
                     EditAgentOutputEvent::ResolvingEditRange(range) => {
                         if let Some(card) = card_clone.as_ref() {
                             card.update(cx, |card, cx| card.reveal_range(range, cx))?;
@@ -328,6 +330,21 @@ impl Tool for EditFileTool {
                         Read the relevant sections of {input_path} again so that
                         I can perform the requested edits.
                     "}
+                );
+                anyhow::ensure!(
+                    ambiguous_ranges.is_empty(),
+                    {
+                        let line_numbers = ambiguous_ranges
+                            .iter()
+                            .map(|range| range.start.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        formatdoc! {"
+                            <old_text> matches more than one position in the file (lines: {line_numbers}). Read the
+                            relevant sections of {input_path} again and extend <old_text> so
+                            that I can perform the requested edits.
+                        "}
+                    }
                 );
                 Ok(ToolResultOutput {
                     content: ToolResultContent::Text("No edits were made.".into()),
@@ -787,11 +804,30 @@ impl ToolCard for EditFileToolCard {
                                         if let Some(active_editor) = item.downcast::<Editor>() {
                                             active_editor
                                                 .update_in(cx, |editor, window, cx| {
-                                                    editor.go_to_singleton_buffer_point(
-                                                        language::Point::new(0, 0),
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    let snapshot =
+                                                        editor.buffer().read(cx).snapshot(cx);
+                                                    let first_hunk = editor
+                                                        .diff_hunks_in_ranges(
+                                                            &[editor::Anchor::min()
+                                                                ..editor::Anchor::max()],
+                                                            &snapshot,
+                                                        )
+                                                        .next();
+                                                    if let Some(first_hunk) = first_hunk {
+                                                        let first_hunk_start =
+                                                            first_hunk.multi_buffer_range().start;
+                                                        editor.change_selections(
+                                                            Some(Autoscroll::fit()),
+                                                            window,
+                                                            cx,
+                                                            |selections| {
+                                                                selections.select_anchor_ranges([
+                                                                    first_hunk_start
+                                                                        ..first_hunk_start,
+                                                                ]);
+                                                            },
+                                                        )
+                                                    }
                                                 })
                                                 .log_err();
                                         }
