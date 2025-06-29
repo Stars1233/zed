@@ -108,6 +108,12 @@ pub struct LanguageServer {
     root_uri: Url,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LanguageServerSelector {
+    Id(LanguageServerId),
+    Name(LanguageServerName),
+}
+
 /// Identifies a running language server.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
@@ -603,7 +609,7 @@ impl LanguageServer {
         Ok(())
     }
 
-    pub fn default_initialize_params(&self, cx: &App) -> InitializeParams {
+    pub fn default_initialize_params(&self, pull_diagnostics: bool, cx: &App) -> InitializeParams {
         let workspace_folders = self
             .workspace_folders
             .lock()
@@ -643,8 +649,9 @@ impl LanguageServer {
                         refresh_support: Some(true),
                     }),
                     diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
-                        refresh_support: None,
-                    }),
+                        refresh_support: Some(true),
+                    })
+                    .filter(|_| pull_diagnostics),
                     code_lens: Some(CodeLensWorkspaceClientCapabilities {
                         refresh_support: Some(true),
                     }),
@@ -758,7 +765,12 @@ impl LanguageServer {
                     }),
                     publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                         related_information: Some(true),
-                        ..Default::default()
+                        version_support: Some(true),
+                        data_support: Some(true),
+                        tag_support: Some(TagSupport {
+                            value_set: vec![DiagnosticTag::UNNECESSARY, DiagnosticTag::DEPRECATED],
+                        }),
+                        code_description_support: Some(true),
                     }),
                     formatting: Some(DynamicRegistrationClientCapabilities {
                         dynamic_registration: Some(true),
@@ -792,6 +804,14 @@ impl LanguageServer {
                     document_symbol: Some(DocumentSymbolClientCapabilities {
                         hierarchical_document_symbol_support: Some(true),
                         ..DocumentSymbolClientCapabilities::default()
+                    }),
+                    diagnostic: Some(DiagnosticClientCapabilities {
+                        dynamic_registration: Some(false),
+                        related_document_support: Some(true),
+                    })
+                    .filter(|_| pull_diagnostics),
+                    color_provider: Some(DocumentColorClientCapabilities {
+                        dynamic_registration: Some(false),
                     }),
                     ..TextDocumentClientCapabilities::default()
                 }),
@@ -1579,7 +1599,7 @@ impl FakeLanguageServer {
         T: 'static + request::Request,
         T::Params: 'static + Send,
         F: 'static + Send + FnMut(T::Params, gpui::AsyncApp) -> Fut,
-        Fut: 'static + Send + Future<Output = Result<T::Result>>,
+        Fut: 'static + Future<Output = Result<T::Result>>,
     {
         let (responded_tx, responded_rx) = futures::channel::mpsc::unbounded();
         self.server.remove_request_handler::<T>();
@@ -1703,7 +1723,7 @@ mod tests {
 
         let server = cx
             .update(|cx| {
-                let params = server.default_initialize_params(cx);
+                let params = server.default_initialize_params(false, cx);
                 let configuration = DidChangeConfigurationParams {
                     settings: Default::default(),
                 };
