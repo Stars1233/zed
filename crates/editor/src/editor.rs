@@ -1790,7 +1790,7 @@ impl ClipboardSelection {
 
 // selections, scroll behavior, was newest selection reversed
 type SelectSyntaxNodeHistoryState = (
-    Box<[Selection<MultiBufferOffset>]>,
+    Box<[Selection<Anchor>]>,
     SelectSyntaxNodeScrollBehavior,
     bool,
 );
@@ -16590,6 +16590,10 @@ impl Editor {
             SelectSyntaxNodeScrollBehavior::CursorBottom
         };
 
+        let old_selections: Box<[Selection<Anchor>]> = old_selections
+            .iter()
+            .map(|s| s.map(|offset| buffer.anchor_before(offset)))
+            .collect();
         self.select_syntax_node_history.push((
             old_selections,
             scroll_behavior,
@@ -16612,9 +16616,15 @@ impl Editor {
                 selection.reversed = is_selection_reversed;
             }
 
+            let snapshot = self.buffer.read(cx).snapshot(cx);
+            let selections: Vec<Selection<MultiBufferOffset>> = selections
+                .iter()
+                .map(|s| s.map(|anchor| anchor.to_offset(&snapshot)))
+                .collect();
+
             self.select_syntax_node_history.disable_clearing = true;
             self.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                s.select(selections.to_vec());
+                s.select(selections);
             });
             self.select_syntax_node_history.disable_clearing = false;
 
@@ -27653,7 +27663,6 @@ impl EditorSnapshot {
     ) -> HashMap<DisplayRow, u32> {
         let initial_offset =
             self.relative_line_delta(current_selection_head, rows.start, count_wrapped_lines);
-        let current_selection_point = current_selection_head.as_display_point().to_point(self);
 
         self.row_infos(rows.start)
             .take(rows.len())
@@ -27664,23 +27673,19 @@ impl EditorSnapshot {
                     || (count_wrapped_lines && row_info.wrapped_buffer_row.is_some())
             })
             .enumerate()
-            .filter(|(_, (row, row_info))| {
-                // We want to check here that
-                // - the row is not the current selection head to ensure the current
-                // line has absolute numbering
-                // - similarly, should the selection head live in a soft-wrapped line
-                // and we are not counting those, that the parent line keeps its
-                // absolute number
-                // - lastly, if we are in a deleted line, it is fine to number this
+            .filter_map(|(i, (row, row_info))| {
+                // We want to ensure here that the current line has absolute
+                // numbering, even if we are in a soft-wrapped line. With the
+                // exception that if we are in a deleted line, we should number this
                 // relative with 0, as otherwise it would have no line number at all
-                (*row != current_selection_head
-                    && (count_wrapped_lines
-                        || row_info.buffer_row != Some(current_selection_point.row)))
+                let relative_line_number = (initial_offset + i as i64).unsigned_abs() as u32;
+
+                (relative_line_number != 0
                     || row_info
                         .diff_status
-                        .is_some_and(|status| status.is_deleted())
+                        .is_some_and(|status| status.is_deleted()))
+                .then_some((row, relative_line_number))
             })
-            .map(|(i, (row, _))| (row, (initial_offset + i as i64).unsigned_abs() as u32))
             .collect()
     }
 }
